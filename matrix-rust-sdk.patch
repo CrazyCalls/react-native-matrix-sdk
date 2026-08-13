@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index e47e06f41..18eb9ba56 100644
+index e47e06f..18eb9ba 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -211,9 +211,9 @@ checksum = "9dbc3a507a82b17ba0d98f6ce8fd6954ea0c8152e98009d36a40d8dcc8ce078a"
@@ -150,7 +150,7 @@ index e47e06f41..18eb9ba56 100644
   "anyhow",
   "textwrap",
 diff --git a/Cargo.toml b/Cargo.toml
-index 23e28a80b..5bb564db5 100644
+index 23e28a8..5bb564d 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -105,8 +105,8 @@ tracing-appender = "0.2.3"
@@ -164,8 +164,71 @@ index 23e28a80b..5bb564db5 100644
  url = "2.5.7"
  uuid = "1.18.1"
  vergen-gitcl = "1.0.8"
+diff --git a/bindings/matrix-sdk-ffi/src/client.rs b/bindings/matrix-sdk-ffi/src/client.rs
+index 2aeacea..dcd1d3b 100644
+--- a/bindings/matrix-sdk-ffi/src/client.rs
++++ b/bindings/matrix-sdk-ffi/src/client.rs
+@@ -881,6 +881,14 @@ impl Client {
+                         .filter_map(|action| action.try_into().ok())
+                         .collect();
+ 
++                    // Extract raw JSON before consuming notification.event
++                    let raw_json = match &notification.event {
++                        RawAnySyncOrStrippedTimelineEvent::Sync(raw) => {
++                            Some(raw.json().get().to_owned())
++                        }
++                        _ => None,
++                    };
++
+                     // Convert SDK event to FFI type
+                     let (sender, event, thread_id) = match notification.event {
+                         RawAnySyncOrStrippedTimelineEvent::Sync(raw) => match raw.deserialize() {
+@@ -990,6 +998,7 @@ impl Client {
+                             has_mention: Some(has_mention),
+                             thread_id,
+                             actions: Some(actions),
++                            raw_json,
+                         },
+                         room_id,
+                     );
+diff --git a/bindings/matrix-sdk-ffi/src/notification.rs b/bindings/matrix-sdk-ffi/src/notification.rs
+index 0b35771..8f2911a 100644
+--- a/bindings/matrix-sdk-ffi/src/notification.rs
++++ b/bindings/matrix-sdk-ffi/src/notification.rs
+@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
+ use matrix_sdk_ui::notification_client::{
+     NotificationClient as SdkNotificationClient, NotificationEvent as SdkNotificationEvent,
+     NotificationItem as SdkNotificationItem, NotificationStatus as SdkNotificationStatus,
++    RawNotificationEvent as SdkRawNotificationEvent,
+ };
+ use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
+ 
+@@ -55,6 +56,12 @@ pub struct NotificationItem {
+ 
+     /// The push actions for this notification (notify, sound, highlight, etc.).
+     pub actions: Option<Vec<crate::notification_settings::Action>>,
++
++    /// The raw decrypted JSON of the event.
++    /// Useful for extracting call signaling content (m.call.answer,
++    /// m.call.candidates, m.call.hangup) which is not exposed through
++    /// the typed event API.
++    pub raw_json: Option<String>,
+ }
+ 
+ impl NotificationItem {
+@@ -91,6 +98,10 @@ impl NotificationItem {
+             actions: item
+                 .actions
+                 .map(|a| a.into_iter().filter_map(|action| action.try_into().ok()).collect()),
++            raw_json: match &item.raw_event {
++                SdkRawNotificationEvent::Timeline(raw) => Some(raw.json().get().to_owned()),
++                _ => None,
++            },
+         }
+     }
+ }
 diff --git a/crates/matrix-sdk/src/lib.rs b/crates/matrix-sdk/src/lib.rs
-index f7ccf826e..76563ca11 100644
+index f7ccf82..76563ca 100644
 --- a/crates/matrix-sdk/src/lib.rs
 +++ b/crates/matrix-sdk/src/lib.rs
 @@ -13,6 +13,7 @@
