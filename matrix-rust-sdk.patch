@@ -227,6 +227,30 @@ index 0b35771..8f2911a 100644
          }
      }
  }
+diff --git a/bindings/matrix-sdk-ffi/src/room/mod.rs b/bindings/matrix-sdk-ffi/src/room/mod.rs
+index a7d6211..124d2b8 100644
+--- a/bindings/matrix-sdk-ffi/src/room/mod.rs
++++ b/bindings/matrix-sdk-ffi/src/room/mod.rs
+@@ -1248,6 +1248,19 @@ impl Room {
+             .into_full_event(self.inner.room_id().to_owned())
+             .into())
+     }
++
++    /// Like `load_or_fetch_event`, but returns the event's full JSON -
++    /// decrypted when the keys are available - instead of the typed event,
++    /// which drops fields of custom event content (e.g. PhoneHQ AI status
++    /// payloads).
++    pub async fn load_or_fetch_event_json(
++        &self,
++        event_id: String,
++    ) -> Result<String, ClientError> {
++        let event_id = EventId::parse(event_id)?;
++        let timeline_event = self.inner.load_or_fetch_event(&event_id, None).await?;
++        Ok(timeline_event.kind.into_raw().json().get().to_owned())
++    }
+ }
+ 
+ /// A thread subscription (MSC4306).
 diff --git a/crates/matrix-sdk/src/lib.rs b/crates/matrix-sdk/src/lib.rs
 index f7ccf82..76563ca 100644
 --- a/crates/matrix-sdk/src/lib.rs
