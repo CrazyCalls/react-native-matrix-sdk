@@ -1,0 +1,337 @@
+diff --git a/bindings/matrix-sdk-ffi/src/client.rs b/bindings/matrix-sdk-ffi/src/client.rs
+index 22a9757bd..c11f50336 100644
+--- a/bindings/matrix-sdk-ffi/src/client.rs
++++ b/bindings/matrix-sdk-ffi/src/client.rs
+@@ -2233,6 +2233,12 @@ async fn notification_handler(
+     let actions: Vec<crate::notification_settings::Action> =
+         notification.actions.into_iter().filter_map(|action| action.try_into().ok()).collect();
+ 
++    // PhoneHQ patch: see `NotificationItem::raw_json`.
++    let raw_json = match &notification.event {
++        RawAnySyncOrStrippedTimelineEvent::Sync(raw) => Some(raw.json().get().to_owned()),
++        _ => None,
++    };
++
+     // Convert SDK event to FFI type
+     let (sender, event, thread_id, raw_event) = match notification.event {
+         RawAnySyncOrStrippedTimelineEvent::Sync(raw) => {
+@@ -2340,6 +2346,7 @@ async fn notification_handler(
+             has_mention: Some(has_mention),
+             thread_id,
+             actions: Some(actions),
++            raw_json,
+         },
+         room_id,
+     );
+diff --git a/bindings/matrix-sdk-ffi/src/notification.rs b/bindings/matrix-sdk-ffi/src/notification.rs
+index c4fc89c8d..b508f473d 100644
+--- a/bindings/matrix-sdk-ffi/src/notification.rs
++++ b/bindings/matrix-sdk-ffi/src/notification.rs
+@@ -76,6 +76,11 @@ pub struct NotificationItem {
+ 
+     /// The push actions for this notification (notify, sound, highlight, etc.).
+     pub actions: Option<Vec<crate::notification_settings::Action>>,
++
++    /// PhoneHQ patch: the raw (decrypted) JSON of a timeline event, `None`
++    /// for an invite. Predates upstream's `raw_event`, which also carries
++    /// invites; kept so the app's readers keep their exact behaviour.
++    pub raw_json: Option<String>,
+ }
+ 
+ impl NotificationItem {
+@@ -122,6 +127,10 @@ impl NotificationItem {
+             actions: item
+                 .actions
+                 .map(|a| a.into_iter().filter_map(|action| action.try_into().ok()).collect()),
++            raw_json: match &item.raw_event {
++                SdkRawNotificationEvent::Timeline(raw) => Some(raw.json().get().to_owned()),
++                SdkRawNotificationEvent::Invite(_) => None,
++            },
+         }
+     }
+ }
+diff --git a/bindings/matrix-sdk-ffi/src/room/mod.rs b/bindings/matrix-sdk-ffi/src/room/mod.rs
+index ad88e73b9..eb701270e 100644
+--- a/bindings/matrix-sdk-ffi/src/room/mod.rs
++++ b/bindings/matrix-sdk-ffi/src/room/mod.rs
+@@ -1269,6 +1269,19 @@ impl Room {
+             .into_full_event(self.inner.room_id().to_owned())
+             .into())
+     }
++
++    /// Like `load_or_fetch_event`, but returns the event's full JSON -
++    /// decrypted when the keys are available - instead of the typed event,
++    /// which drops fields of custom event content (e.g. PhoneHQ AI status
++    /// payloads).
++    pub async fn load_or_fetch_event_json(
++        &self,
++        event_id: String,
++    ) -> Result<String, ClientError> {
++        let event_id = EventId::parse(event_id)?;
++        let timeline_event = self.inner.load_or_fetch_event(&event_id, None).await?;
++        Ok(timeline_event.kind.into_raw().json().get().to_owned())
++    }
+ }
+ 
+ /// A listener for receiving call decline events in a room.
+diff --git a/bindings/matrix-sdk-ffi/src/timeline/content.rs b/bindings/matrix-sdk-ffi/src/timeline/content.rs
+index 7cbd756e0..d996a1f73 100644
+--- a/bindings/matrix-sdk-ffi/src/timeline/content.rs
++++ b/bindings/matrix-sdk-ffi/src/timeline/content.rs
+@@ -46,6 +46,13 @@ impl From<matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent
+                     declined_by: declinations.iter().map(|u| u.to_string()).collect(),
+                 }
+             }
++
++            Content::CallSignal(signal) => TimelineItemContent::CallSignal {
++                kind: signal.kind.into(),
++                call_id: signal.call_id,
++                reason: signal.reason,
++            },
++
+             Content::MembershipChange(membership) => {
+                 let reason = match membership.content() {
+                     StateEventContentChange::Original { content, .. } => content.reason.clone(),
+@@ -167,6 +174,14 @@ pub enum TimelineItemContent {
+         call_intent: Option<String>,
+         declined_by: Vec<String>,
+     },
++    /// PhoneHQ patch: an `m.call.answer`, `m.call.select_answer`,
++    /// `m.call.hangup` or `m.call.reject`, for the app to fold onto the
++    /// `CallInvite` with the same `call_id`. Not meant to be drawn.
++    CallSignal {
++        kind: CallSignalKind,
++        call_id: String,
++        reason: Option<String>,
++    },
+     RoomMembership {
+         user_id: String,
+         user_display_name: Option<String>,
+@@ -489,3 +504,24 @@ impl From<&matrix_sdk_ui::timeline::AnyOtherStateEventContentChange> for OtherSt
+         }
+     }
+ }
++
++/// PhoneHQ patch: see [`TimelineItemContent::CallSignal`].
++#[derive(Clone, uniffi::Enum)]
++pub enum CallSignalKind {
++    Answer,
++    SelectAnswer,
++    Hangup,
++    Reject,
++}
++
++impl From<matrix_sdk_ui::timeline::CallSignalKind> for CallSignalKind {
++    fn from(value: matrix_sdk_ui::timeline::CallSignalKind) -> Self {
++        use matrix_sdk_ui::timeline::CallSignalKind as Kind;
++        match value {
++            Kind::Answer => Self::Answer,
++            Kind::SelectAnswer => Self::SelectAnswer,
++            Kind::Hangup => Self::Hangup,
++            Kind::Reject => Self::Reject,
++        }
++    }
++}
+diff --git a/crates/matrix-sdk-ui/src/timeline/controller/mod.rs b/crates/matrix-sdk-ui/src/timeline/controller/mod.rs
+index 554ac3612..b453abc6b 100644
+--- a/crates/matrix-sdk-ui/src/timeline/controller/mod.rs
++++ b/crates/matrix-sdk-ui/src/timeline/controller/mod.rs
+@@ -317,6 +317,11 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
+                         // Ignore decline events, the matching RtcNotification event will be updated
+                         // to reflect the decline.
+                         AnyMessageLikeEventContent::RtcDecline(_) => false,
++                        // PhoneHQ patch: see `TimelineItemContent::CallSignal`.
++                        AnyMessageLikeEventContent::CallAnswer(_)
++                        | AnyMessageLikeEventContent::CallSelectAnswer(_)
++                        | AnyMessageLikeEventContent::CallHangup(_)
++                        | AnyMessageLikeEventContent::CallReject(_) => true,
+ 
+                         _ => false,
+                     }
+diff --git a/crates/matrix-sdk-ui/src/timeline/event_handler.rs b/crates/matrix-sdk-ui/src/timeline/event_handler.rs
+index 02ae3c59f..6b3fae641 100644
+--- a/crates/matrix-sdk-ui/src/timeline/event_handler.rs
++++ b/crates/matrix-sdk-ui/src/timeline/event_handler.rs
+@@ -60,7 +60,7 @@ use super::{
+ };
+ use crate::{
+     timeline::{
+-        TimelineUniqueId, controller::aggregations::PendingEdit, event_item::OtherMessageLike,
++        CallSignal, CallSignalKind, TimelineUniqueId, controller::aggregations::PendingEdit, event_item::OtherMessageLike,
+     },
+     unable_to_decrypt_hook::UtdHookManager,
+ };
+@@ -427,6 +427,39 @@ impl TimelineAction {
+                 kind: HandleAggregationKind::CallDeclined,
+             },
+ 
++            // PhoneHQ patch: see `TimelineItemContent::CallSignal`.
++            AnyMessageLikeEventContent::CallAnswer(c) => Self::add_item(
++                TimelineItemContent::CallSignal(CallSignal {
++                    kind: CallSignalKind::Answer,
++                    call_id: c.call_id.to_string(),
++                    reason: None,
++                }),
++            ),
++
++            AnyMessageLikeEventContent::CallSelectAnswer(c) => Self::add_item(
++                TimelineItemContent::CallSignal(CallSignal {
++                    kind: CallSignalKind::SelectAnswer,
++                    call_id: c.call_id.to_string(),
++                    reason: None,
++                }),
++            ),
++
++            AnyMessageLikeEventContent::CallHangup(c) => Self::add_item(
++                TimelineItemContent::CallSignal(CallSignal {
++                    kind: CallSignalKind::Hangup,
++                    call_id: c.call_id.to_string(),
++                    reason: Some(c.reason.as_str().to_owned()),
++                }),
++            ),
++
++            AnyMessageLikeEventContent::CallReject(c) => Self::add_item(
++                TimelineItemContent::CallSignal(CallSignal {
++                    kind: CallSignalKind::Reject,
++                    call_id: c.call_id.to_string(),
++                    reason: None,
++                }),
++            ),
++
+             AnyMessageLikeEventContent::Sticker(content) => {
+                 Self::add_item(TimelineItemContent::MsgLike(MsgLikeContent {
+                     kind: MsgLikeKind::Sticker(Sticker { content }),
+diff --git a/crates/matrix-sdk-ui/src/timeline/event_item/content/mod.rs b/crates/matrix-sdk-ui/src/timeline/event_item/content/mod.rs
+index c65d974bd..dafc9e0e4 100644
+--- a/crates/matrix-sdk-ui/src/timeline/event_item/content/mod.rs
++++ b/crates/matrix-sdk-ui/src/timeline/event_item/content/mod.rs
+@@ -127,6 +127,39 @@ pub enum TimelineItemContent {
+         /// Users who have declined this call notification
+         declined_by: Vec<OwnedUserId>,
+     },
++
++    /// An `m.call.answer`, `m.call.select_answer`, `m.call.hangup` or
++    /// `m.call.reject` event.
++    ///
++    /// PhoneHQ patch: upstream drops these, so a client cannot tell an
++    /// answered call from a missed one. Carried as their own items so the app
++    /// can fold them onto the matching `CallInvite` by `call_id`, as clients
++    /// built on matrix-js-sdk do; they are not meant to be drawn.
++    CallSignal(CallSignal),
++}
++
++/// What an [`TimelineItemContent::CallSignal`] did to its call.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CallSignalKind {
++    /// `m.call.answer`
++    Answer,
++    /// `m.call.select_answer`
++    SelectAnswer,
++    /// `m.call.hangup`
++    Hangup,
++    /// `m.call.reject`
++    Reject,
++}
++
++/// An `m.call.*` event after the invite, by the call it belongs to.
++#[derive(Clone, Debug)]
++pub struct CallSignal {
++    /// The event type.
++    pub kind: CallSignalKind,
++    /// The `call_id` shared with the call's `m.call.invite`.
++    pub call_id: String,
++    /// The hangup reason, for `m.call.hangup` only.
++    pub reason: Option<String>,
+ }
+ 
+ impl TimelineItemContent {
+@@ -152,6 +185,15 @@ impl TimelineItemContent {
+             Self::FailedToParseState { event_type, .. } => Some(event_type.to_string()),
+             Self::CallInvite => Some(MessageLikeEventType::CallInvite.to_string()),
+             Self::RtcNotification { .. } => Some(MessageLikeEventType::RtcNotification.to_string()),
++            Self::CallSignal(signal) => Some(
++                match signal.kind {
++                    CallSignalKind::Answer => MessageLikeEventType::CallAnswer,
++                    CallSignalKind::SelectAnswer => MessageLikeEventType::CallSelectAnswer,
++                    CallSignalKind::Hangup => MessageLikeEventType::CallHangup,
++                    CallSignalKind::Reject => MessageLikeEventType::CallReject,
++                }
++                .to_string(),
++            ),
+         }
+     }
+ 
+@@ -329,6 +371,7 @@ impl TimelineItemContent {
+             | TimelineItemContent::FailedToParseState { .. } => "an event that couldn't be parsed",
+             TimelineItemContent::CallInvite => "a call invite",
+             TimelineItemContent::RtcNotification { .. } => "a call notification",
++            TimelineItemContent::CallSignal(_) => "a call signal",
+         }
+     }
+ 
+@@ -399,7 +442,8 @@ impl TimelineItemContent {
+ 
+     pub(in crate::timeline) fn redact(&self, rules: &RedactionRules) -> Self {
+         match self {
+-            Self::MsgLike(_) | Self::CallInvite | Self::RtcNotification { .. } => {
++            Self::MsgLike(_) | Self::CallInvite | Self::RtcNotification { .. }
++            | Self::CallSignal(_) => {
+                 TimelineItemContent::MsgLike(MsgLikeContent::redacted())
+             }
+             Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(rules)),
+@@ -431,7 +475,8 @@ impl TimelineItemContent {
+             | TimelineItemContent::FailedToParseMessageLike { .. }
+             | TimelineItemContent::FailedToParseState { .. }
+             | TimelineItemContent::CallInvite
+-            | TimelineItemContent::RtcNotification { .. } => {
++            | TimelineItemContent::RtcNotification { .. }
++            | TimelineItemContent::CallSignal(_) => {
+                 // No reactions for these kind of items.
+                 None
+             }
+@@ -456,7 +501,8 @@ impl TimelineItemContent {
+             | TimelineItemContent::FailedToParseMessageLike { .. }
+             | TimelineItemContent::FailedToParseState { .. }
+             | TimelineItemContent::CallInvite
+-            | TimelineItemContent::RtcNotification { .. } => {
++            | TimelineItemContent::RtcNotification { .. }
++            | TimelineItemContent::CallSignal(_) => {
+                 // No reactions for these kind of items.
+                 None
+             }
+diff --git a/crates/matrix-sdk-ui/src/timeline/event_item/mod.rs b/crates/matrix-sdk-ui/src/timeline/event_item/mod.rs
+index f2877a47f..a5bf47205 100644
+--- a/crates/matrix-sdk-ui/src/timeline/event_item/mod.rs
++++ b/crates/matrix-sdk-ui/src/timeline/event_item/mod.rs
+@@ -41,7 +41,7 @@ mod remote;
+ 
+ pub use self::{
+     content::{
+-        AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
++        AnyOtherStateEventContentChange, BeaconInfo, CallSignal, CallSignalKind, EmbeddedEvent, EncryptedMessage,
+         InReplyToDetails, LiveLocationState, MemberProfileChange, MembershipChange, Message,
+         MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState,
+         RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
+@@ -652,7 +652,8 @@ impl EventTimelineItem {
+             | TimelineItemContent::FailedToParseMessageLike { .. }
+             | TimelineItemContent::FailedToParseState { .. }
+             | TimelineItemContent::CallInvite
+-            | TimelineItemContent::RtcNotification { .. } => None,
++            | TimelineItemContent::RtcNotification { .. }
++            | TimelineItemContent::CallSignal(_) => None,
+         };
+ 
+         if let Some(body) = body {
+diff --git a/crates/matrix-sdk-ui/src/timeline/mod.rs b/crates/matrix-sdk-ui/src/timeline/mod.rs
+index 53456f7f3..bebe4ce31 100644
+--- a/crates/matrix-sdk-ui/src/timeline/mod.rs
++++ b/crates/matrix-sdk-ui/src/timeline/mod.rs
+@@ -89,7 +89,7 @@ pub use self::{
+     error::*,
+     event_filter::{TimelineEventCondition, TimelineEventFilter},
+     event_item::{
+-        AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
++        AnyOtherStateEventContentChange, BeaconInfo, CallSignal, CallSignalKind, EmbeddedEvent, EncryptedMessage,
+         EventItemOrigin, EventSendState, EventTimelineItem, InReplyToDetails, LiveLocationState,
+         MediaUploadProgress, MemberProfileChange, MembershipChange, Message, MsgLikeContent,
+         MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState, Profile, ReactionInfo,
