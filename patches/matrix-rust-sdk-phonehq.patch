@@ -51,10 +51,10 @@ index c4fc89c8d..b508f473d 100644
      }
  }
 diff --git a/bindings/matrix-sdk-ffi/src/room/mod.rs b/bindings/matrix-sdk-ffi/src/room/mod.rs
-index ad88e73b9..eb701270e 100644
+index ad88e73b9..ec5af0978 100644
 --- a/bindings/matrix-sdk-ffi/src/room/mod.rs
 +++ b/bindings/matrix-sdk-ffi/src/room/mod.rs
-@@ -1269,6 +1269,19 @@ impl Room {
+@@ -1269,6 +1269,35 @@ impl Room {
              .into_full_event(self.inner.room_id().to_owned())
              .into())
      }
@@ -70,6 +70,22 @@ index ad88e73b9..eb701270e 100644
 +        let event_id = EventId::parse(event_id)?;
 +        let timeline_event = self.inner.load_or_fetch_event(&event_id, None).await?;
 +        Ok(timeline_event.kind.into_raw().json().get().to_owned())
++    }
++
++    /// PhoneHQ patch: the room's latest event as its full JSON (decrypted
++    /// when the keys are available), `None` unless it is a remote event.
++    ///
++    /// Stands in for the `EventTimelineItem` the pre-0.18 `latest_event()`
++    /// returned: the [`LatestEventValue`] that replaced it carries no event
++    /// id and no raw envelope, which the app's read-point and room-preview
++    /// lanes need.
++    pub fn latest_event_json(&self) -> Option<String> {
++        match matrix_sdk_base::Room::latest_event(&self.inner) {
++            matrix_sdk_base::latest_event::LatestEventValue::Remote(event) => {
++                Some(event.raw().json().get().to_owned())
++            }
++            _ => None,
++        }
 +    }
  }
  
